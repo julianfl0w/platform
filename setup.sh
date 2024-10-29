@@ -1,5 +1,8 @@
-./install_go_1.22.sh
+sudo rm -rf keys
+mkdir keys
 sudo chmod 777 keys
-export PATH=${PWD}/gobin/go/bin:$PATH
 ./.github/scripts/init-temp-keys.sh
 sudo chmod 777 keys/*
+sudo chmod 777 *.pem
+docker build -t opentdf:latest .
+
