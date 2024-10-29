@@ -45,7 +45,3 @@ sensitive.txt.tdf
 keys/
 /examples/sensitive.txt.ntdf
 sensitive.txt.ntdf
-
-gobin
-go1.22.1.linux-amd64.tar.gz
-go-install-dir
