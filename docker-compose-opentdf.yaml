@@ -12,7 +12,7 @@ services:
       - "8080:8080"
     command: start
     volumes:
-      - ./opentdf.yaml:/app/opentdf.yaml
+      - ./opentdf-dev.yaml:/app/opentdf.yaml
       - ./kas-cert.pem:/app/kas-cert.pem
       - ./kas-ec-cert.pem:/app/kas-ec-cert.pem
       - ./kas-private.pem:/app/kas-private.pem
