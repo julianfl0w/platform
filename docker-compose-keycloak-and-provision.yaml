@@ -1,16 +1,23 @@
+networks:
+  default:
+    name: opentdf_platform
 services:
   keycloak:
     container_name: keycloak
     volumes:
-      - ./keys/localhost.crt:/etc/x509/tls/localhost.crt
-      - ./keys/localhost.key:/etc/x509/tls/localhost.key
-      - ./keys/ca.jks:/truststore/truststore.jks
-      - ./KCSetup:/opt/keycloak/KCSetup
-      - ./oauth_certs:/opt/keycloak/oauth_certs
-      - ./keycloak-startup.sh:/opt/keycloak/keycloak-startup.sh
+    - ./keys/localhost.crt:/etc/x509/tls/localhost.crt
+    - ./keys/localhost.key:/etc/x509/tls/localhost.key
+    - ./keys/ca.jks:/truststore/truststore.jks
+    # This is kc 24.0.1 with opentdf protocol mapper on board
     image: cgr.dev/chainguard/keycloak@sha256:37895558d2e0e93ffff75da5900f9ae7e79ec6d1c390b18b2ecea6cee45ec26f
     restart: always
-    entrypoint: ["/bin/bash", "/opt/keycloak/keycloak-startup.sh"]
+    command:
+    - "start-dev"
+    - "--verbose"
+    - "-Djavax.net.ssl.trustStorePassword=password"
+    - "-Djavax.net.ssl.HostnameVerifier=AllowAll"
+    - "-Djavax.net.ssl.trustStore=/truststore/truststore.jks"
+    - "--spi-truststore-file-hostname-verification-policy=ANY"
     environment:
       KC_PROXY: edge
       KC_HTTP_RELATIVE_PATH: /auth
@@ -46,3 +53,37 @@ services:
       timeout: 10s
       retries: 3
       start_period: 2m
+  keycloakdb:
+    image: postgres:15-alpine
+    restart: always
+    user: postgres
+    environment:
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_USER: postgres
+      POSTGRES_DB: keycloak
+    volumes:
+      - keycloakdb_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  opentdf_provision:
+    image: opentdf:latest
+    container_name: opentdf_provision
+    restart: no
+    environment:
+      KEYCLOAK_BASE_URL: https://keycloak.juliancoy.us
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    command: provision keycloak -e https://keycloak.juliancoy.us/auth -f /app/service/cmd/keycloak_data.yaml
+    volumes:
+      - ./service/cmd/keycloak_data.yaml:/app/service/cmd/keycloak_data.yaml
+      - ./opentdf.yaml:/app/service/opentdf.yaml
+
+volumes:
+  keycloakdb_data:

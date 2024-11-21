@@ -1,0 +1,16 @@
+networks:
+  default:
+    name: opentdf_platform
+services:
+  opentdf_provision:
+    image: opentdf:latest
+    container_name: opentdf_provision
+    restart: no
+    environment:
+      KEYCLOAK_BASE_URL: https://localhost:8888
+    ports:
+      - "8080:8080"
+    command: provision keycloak -e https://localhost:8888/auth -f /app/service/cmd/keycloak_data.yaml
+    volumes:
+      - ./service/cmd/keycloak_data.yaml:/app/service/cmd/keycloak_data.yaml
+      - ./opentdf.yaml:/app/service/opentdf.yaml
