@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"strings"
 
 	"github.com/google/uuid"
@@ -115,7 +114,10 @@ func hydrateAttribute(row *attributeQueryRow) (*policy.Attribute, error) {
 // CRUD operations
 ///
 
-func (c PolicyDBClient) ListAttributes(ctx context.Context, state string, namespace string) ([]*policy.Attribute, error) {
+func (c PolicyDBClient) ListAttributes(ctx context.Context, r *attributes.ListAttributesRequest) (*attributes.ListAttributesResponse, error) {
+	namespace := r.GetNamespace()
+	state := getDBStateTypeTransformedEnum(r.GetState())
+	limit, offset := c.getRequestedLimitOffset(r.GetPagination())
 	var (
 		active = pgtype.Bool{
 			Valid: false,
@@ -124,8 +126,13 @@ func (c PolicyDBClient) ListAttributes(ctx context.Context, state string, namesp
 		namespaceName = ""
 	)
 
-	if state != "" && state != StateAny {
-		active = pgtypeBool(state == StateActive)
+	maxLimit := c.listCfg.limitMax
+	if maxLimit > 0 && limit > maxLimit {
+		return nil, db.ErrListLimitTooLarge
+	}
+
+	if state != stateAny {
+		active = pgtypeBool(state == stateActive)
 	}
 
 	if namespace != "" {
@@ -140,6 +147,8 @@ func (c PolicyDBClient) ListAttributes(ctx context.Context, state string, namesp
 		Active:        active,
 		NamespaceID:   namespaceID,
 		NamespaceName: namespaceName,
+		Limit:         limit,
+		Offset:        offset,
 	})
 	if err != nil {
 		return nil, db.WrapIfKnownInvalidQueryErr(err)
@@ -164,12 +173,49 @@ func (c PolicyDBClient) ListAttributes(ctx context.Context, state string, namesp
 		}
 	}
 
-	return policyAttributes, nil
+	var total int32
+	var nextOffset int32
+	if len(list) > 0 {
+		total = int32(list[0].Total)
+		nextOffset = getNextOffset(offset, limit, total)
+	}
+
+	return &attributes.ListAttributesResponse{
+		Attributes: policyAttributes,
+		Pagination: &policy.PageResponse{
+			CurrentOffset: offset,
+			Total:         total,
+			NextOffset:    nextOffset,
+		},
+	}, nil
 }
 
+// Loads all attributes into memory by making iterative db roundtrip requests of defaultObjectListAllLimit size
 func (c PolicyDBClient) ListAllAttributes(ctx context.Context) ([]*policy.Attribute, error) {
-	// call general List method with empty params to get all attributes
-	return c.ListAttributes(ctx, "", "")
+	var nextOffset int32
+	attrsList := make([]*policy.Attribute, 0)
+
+	for {
+		listed, err := c.ListAttributes(ctx, &attributes.ListAttributesRequest{
+			State: common.ActiveStateEnum_ACTIVE_STATE_ENUM_ANY,
+			Pagination: &policy.PageRequest{
+				Limit:  c.listCfg.limitMax,
+				Offset: nextOffset,
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list all attributes: %w", err)
+		}
+
+		nextOffset = listed.GetPagination().GetNextOffset()
+		attrsList = append(attrsList, listed.GetAttributes()...)
+
+		// offset becomes zero when list is exhausted
+		if nextOffset <= 0 {
+			break
+		}
+	}
+	return attrsList, nil
 }
 
 func (c PolicyDBClient) GetAttribute(ctx context.Context, id string) (*policy.Attribute, error) {
@@ -254,7 +300,9 @@ func (c PolicyDBClient) GetAttributeByFqn(ctx context.Context, fqn string) (*pol
 }
 
 func (c PolicyDBClient) GetAttributesByNamespace(ctx context.Context, namespaceID string) ([]*policy.Attribute, error) {
-	list, err := c.Queries.ListAttributesSummary(ctx, namespaceID)
+	list, err := c.Queries.ListAttributesSummary(ctx, ListAttributesSummaryParams{
+		NamespaceID: namespaceID,
+	})
 	if err != nil {
 		return nil, db.WrapIfKnownInvalidQueryErr(err)
 	}
@@ -282,7 +330,7 @@ func (c PolicyDBClient) GetAttributesByNamespace(ctx context.Context, namespaceI
 func (c PolicyDBClient) CreateAttribute(ctx context.Context, r *attributes.CreateAttributeRequest) (*policy.Attribute, error) {
 	name := strings.ToLower(r.GetName())
 	namespaceID := r.GetNamespaceId()
-	metadataJSON, metadata, err := db.MarshalCreateMetadata(r.GetMetadata())
+	metadataJSON, _, err := db.MarshalCreateMetadata(r.GetMetadata())
 	if err != nil {
 		return nil, err
 	}
@@ -299,48 +347,24 @@ func (c PolicyDBClient) CreateAttribute(ctx context.Context, r *attributes.Creat
 	}
 
 	// Add values
-	var values []*policy.Value
 	for _, v := range r.GetValues() {
 		req := &attributes.CreateAttributeValueRequest{
 			AttributeId: createdID,
 			Value:       v,
 		}
-		value, err := c.CreateAttributeValue(ctx, createdID, req)
+		_, err := c.CreateAttributeValue(ctx, createdID, req)
 		if err != nil {
 			return nil, err
 		}
-		values = append(values, value)
 	}
 
 	// Update the FQNs
-	fqn := c.upsertAttrFqn(ctx, attrFqnUpsertOptions{
-		namespaceID: namespaceID,
-		attributeID: createdID,
-	})
-	c.logger.DebugContext(ctx, "upserted fqn with new attribute definition", slog.Any("fqn", fqn))
-
-	for _, v := range values {
-		fqn = c.upsertAttrFqn(ctx, attrFqnUpsertOptions{
-			namespaceID: namespaceID,
-			attributeID: createdID,
-			valueID:     v.GetId(),
-		})
-		c.logger.DebugContext(ctx, "upserted fqn with new attribute value on new definition create", slog.Any("fqn", fqn))
+	_, err = c.Queries.UpsertAttributeDefinitionFqn(ctx, createdID)
+	if err != nil {
+		return nil, db.WrapIfKnownInvalidQueryErr(err)
 	}
 
-	a := &policy.Attribute{
-		Id:       createdID,
-		Name:     name,
-		Rule:     r.GetRule(),
-		Metadata: metadata,
-		Namespace: &policy.Namespace{
-			Id: namespaceID,
-		},
-		Active: &wrapperspb.BoolValue{Value: true},
-		Values: values,
-		Fqn:    fqn,
-	}
-	return a, nil
+	return c.GetAttribute(ctx, createdID)
 }
 
 func (c PolicyDBClient) UnsafeUpdateAttribute(ctx context.Context, r *unsafe.UnsafeUpdateAttributeRequest) (*policy.Attribute, error) {
@@ -396,27 +420,15 @@ func (c PolicyDBClient) UnsafeUpdateAttribute(ctx context.Context, r *unsafe.Uns
 		return nil, db.ErrNotFound
 	}
 
-	attribute := &policy.Attribute{
-		Id:   id,
-		Name: name,
-		Rule: rule,
-	}
-
 	// Upsert all the FQNs with the definition name mutation
 	if name != "" {
-		namespaceID := before.GetNamespace().GetId()
-		attrFqn := c.upsertAttrFqn(ctx, attrFqnUpsertOptions{namespaceID: namespaceID, attributeID: id})
-		c.logger.Debug("upserted attribute fqn with new definition name", slog.Any("fqn", attrFqn))
-		if len(before.GetValues()) > 0 {
-			for _, v := range before.GetValues() {
-				fqn := c.upsertAttrFqn(ctx, attrFqnUpsertOptions{namespaceID: namespaceID, attributeID: id, valueID: v.GetId()})
-				c.logger.Debug("upserted attribute value fqn with new definition name", slog.Any("fqn", fqn))
-			}
+		_, err = c.Queries.UpsertAttributeDefinitionFqn(ctx, id)
+		if err != nil {
+			return nil, db.WrapIfKnownInvalidQueryErr(err)
 		}
-		attribute.Fqn = attrFqn
 	}
 
-	return attribute, nil
+	return c.GetAttribute(ctx, id)
 }
 
 func (c PolicyDBClient) UpdateAttribute(ctx context.Context, id string, r *attributes.UpdateAttributeRequest) (*policy.Attribute, error) {

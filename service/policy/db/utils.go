@@ -10,18 +10,25 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-func constructMetadata(table string, isJSON bool) string {
-	if table != "" {
-		table += "."
-	}
-	metadata := "JSON_STRIP_NULLS(JSON_BUILD_OBJECT('labels', " + table + "metadata->'labels', 'created_at', " + table + "created_at, 'updated_at', " + table + "updated_at))"
+// Gathers request pagination limit/offset or configured default
+func (c PolicyDBClient) getRequestedLimitOffset(page *policy.PageRequest) (int32, int32) {
+	return getListLimit(page.GetLimit(), c.listCfg.limitDefault), page.GetOffset()
+}
 
-	if isJSON {
-		metadata = "'metadata', " + metadata + ", "
-	} else {
-		metadata += " AS metadata"
+func getListLimit(limit int32, fallback int32) int32 {
+	if limit > 0 {
+		return limit
 	}
-	return metadata
+	return fallback
+}
+
+// Returns next page's offset if has not yet reached total, or else returns 0
+func getNextOffset(currentOffset, limit, total int32) int32 {
+	next := currentOffset + limit
+	if next < total {
+		return next
+	}
+	return 0
 }
 
 func unmarshalMetadata(metadataJSON []byte, m *common.Metadata) error {

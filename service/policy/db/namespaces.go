@@ -44,21 +44,32 @@ func (c PolicyDBClient) GetNamespace(ctx context.Context, id string) (*policy.Na
 	}, nil
 }
 
-func (c PolicyDBClient) ListNamespaces(ctx context.Context, state string) ([]*policy.Namespace, error) {
+func (c PolicyDBClient) ListNamespaces(ctx context.Context, r *namespaces.ListNamespacesRequest) (*namespaces.ListNamespacesResponse, error) {
+	limit, offset := c.getRequestedLimitOffset(r.GetPagination())
+
+	maxLimit := c.listCfg.limitMax
+	if maxLimit > 0 && limit > maxLimit {
+		return nil, db.ErrListLimitTooLarge
+	}
+
 	active := pgtype.Bool{
 		Valid: false,
 	}
-
-	if state != "" && state != StateAny {
-		active = pgtypeBool(state == StateActive)
+	state := getDBStateTypeTransformedEnum(r.GetState())
+	if state != stateAny {
+		active = pgtypeBool(state == stateActive)
 	}
 
-	list, err := c.Queries.ListNamespaces(ctx, active)
+	list, err := c.Queries.ListNamespaces(ctx, ListNamespacesParams{
+		Active: active,
+		Limit:  limit,
+		Offset: offset,
+	})
 	if err != nil {
 		return nil, db.WrapIfKnownInvalidQueryErr(err)
 	}
 
-	namespaces := make([]*policy.Namespace, len(list))
+	nsList := make([]*policy.Namespace, len(list))
 
 	for i, ns := range list {
 		metadata := &common.Metadata{}
@@ -66,7 +77,7 @@ func (c PolicyDBClient) ListNamespaces(ctx context.Context, state string) ([]*po
 			return nil, err
 		}
 
-		namespaces[i] = &policy.Namespace{
+		nsList[i] = &policy.Namespace{
 			Id:       ns.ID,
 			Name:     ns.Name,
 			Active:   &wrapperspb.BoolValue{Value: ns.Active},
@@ -75,12 +86,54 @@ func (c PolicyDBClient) ListNamespaces(ctx context.Context, state string) ([]*po
 		}
 	}
 
-	return namespaces, nil
+	var total int32
+	var nextOffset int32
+	if len(list) > 0 {
+		total = int32(list[0].Total)
+		nextOffset = getNextOffset(offset, limit, total)
+	}
+
+	return &namespaces.ListNamespacesResponse{
+		Namespaces: nsList,
+		Pagination: &policy.PageResponse{
+			CurrentOffset: offset,
+			Total:         total,
+			NextOffset:    nextOffset,
+		},
+	}, nil
+}
+
+// Loads all namespaces into memory by making iterative db roundtrip requests of defaultObjectListAllLimit size
+func (c PolicyDBClient) ListAllNamespaces(ctx context.Context) ([]*policy.Namespace, error) {
+	var nextOffset int32
+	nsList := make([]*policy.Namespace, 0)
+
+	for {
+		listed, err := c.ListNamespaces(ctx, &namespaces.ListNamespacesRequest{
+			State: common.ActiveStateEnum_ACTIVE_STATE_ENUM_ANY,
+			Pagination: &policy.PageRequest{
+				Limit:  c.listCfg.limitMax,
+				Offset: nextOffset,
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list all namespaces: %w", err)
+		}
+
+		nextOffset = listed.GetPagination().GetNextOffset()
+		nsList = append(nsList, listed.GetNamespaces()...)
+
+		// offset becomes zero when list is exhausted
+		if nextOffset <= 0 {
+			break
+		}
+	}
+	return nsList, nil
 }
 
 func (c PolicyDBClient) CreateNamespace(ctx context.Context, r *namespaces.CreateNamespaceRequest) (*policy.Namespace, error) {
 	name := strings.ToLower(r.GetName())
-	metadataJSON, metadata, err := db.MarshalCreateMetadata(r.GetMetadata())
+	metadataJSON, _, err := db.MarshalCreateMetadata(r.GetMetadata())
 	if err != nil {
 		return nil, err
 	}
@@ -94,16 +147,12 @@ func (c PolicyDBClient) CreateNamespace(ctx context.Context, r *namespaces.Creat
 	}
 
 	// Update FQN
-	fqn := c.upsertAttrFqn(ctx, attrFqnUpsertOptions{namespaceID: createdID})
-	c.logger.Debug("upserted fqn for created namespace", slog.Any("fqn", fqn))
+	_, err = c.Queries.UpsertAttributeNamespaceFqn(ctx, createdID)
+	if err != nil {
+		return nil, db.WrapIfKnownInvalidQueryErr(err)
+	}
 
-	return &policy.Namespace{
-		Id:       createdID,
-		Name:     name,
-		Active:   &wrapperspb.BoolValue{Value: true},
-		Metadata: metadata,
-		Fqn:      fqn,
-	}, nil
+	return c.GetNamespace(ctx, createdID)
 }
 
 func (c PolicyDBClient) UpdateNamespace(ctx context.Context, id string, r *namespaces.UpdateNamespaceRequest) (*policy.Namespace, error) {
@@ -157,27 +206,12 @@ func (c PolicyDBClient) UnsafeUpdateNamespace(ctx context.Context, id string, na
 	}
 
 	// Update all FQNs that may contain the namespace name
-	nsFqn := c.upsertAttrFqn(ctx, attrFqnUpsertOptions{namespaceID: id})
-	c.logger.Debug("upserted fqn for unsafely updated namespace", slog.Any("fqn", nsFqn))
-
-	attrs, err := c.ListAttributes(ctx, StateAny, id)
+	_, err = c.Queries.UpsertAttributeNamespaceFqn(ctx, id)
 	if err != nil {
-		return nil, err
-	}
-	for _, attr := range attrs {
-		fqn := c.upsertAttrFqn(ctx, attrFqnUpsertOptions{namespaceID: id, attributeID: attr.GetId()})
-		c.logger.Debug("upserted definition fqn for unsafely updated namespace", slog.Any("fqn", fqn))
-		for _, value := range attr.GetValues() {
-			fqn = c.upsertAttrFqn(ctx, attrFqnUpsertOptions{namespaceID: id, attributeID: attr.GetId(), valueID: value.GetId()})
-			c.logger.Debug("upserted value fqn for unsafely updated namespace", slog.Any("fqn", fqn))
-		}
+		return nil, db.WrapIfKnownInvalidQueryErr(err)
 	}
 
-	return &policy.Namespace{
-		Id:   id,
-		Name: name,
-		Fqn:  nsFqn,
-	}, nil
+	return c.GetNamespace(ctx, id)
 }
 
 func (c PolicyDBClient) DeactivateNamespace(ctx context.Context, id string) (*policy.Namespace, error) {

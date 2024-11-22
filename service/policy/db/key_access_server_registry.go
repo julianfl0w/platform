@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/opentdf/platform/protocol/go/common"
 	"github.com/opentdf/platform/protocol/go/policy"
@@ -11,8 +12,18 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-func (c PolicyDBClient) ListKeyAccessServers(ctx context.Context) ([]*policy.KeyAccessServer, error) {
-	list, err := c.Queries.ListKeyAccessServers(ctx)
+func (c PolicyDBClient) ListKeyAccessServers(ctx context.Context, r *kasregistry.ListKeyAccessServersRequest) (*kasregistry.ListKeyAccessServersResponse, error) {
+	limit, offset := c.getRequestedLimitOffset(r.GetPagination())
+
+	maxLimit := c.listCfg.limitMax
+	if maxLimit > 0 && limit > maxLimit {
+		return nil, db.ErrListLimitTooLarge
+	}
+
+	list, err := c.Queries.ListKeyAccessServers(ctx, ListKeyAccessServersParams{
+		Offset: offset,
+		Limit:  limit,
+	})
 	if err != nil {
 		return nil, db.WrapIfKnownInvalidQueryErr(err)
 	}
@@ -36,12 +47,26 @@ func (c PolicyDBClient) ListKeyAccessServers(ctx context.Context) ([]*policy.Key
 		keyAccessServer.Id = kas.ID
 		keyAccessServer.Uri = kas.Uri
 		keyAccessServer.PublicKey = publicKey
+		keyAccessServer.Name = kas.KasName.String
 		keyAccessServer.Metadata = metadata
 
 		keyAccessServers[i] = keyAccessServer
 	}
+	var total int32
+	var nextOffset int32
+	if len(list) > 0 {
+		total = int32(list[0].Total)
+		nextOffset = getNextOffset(offset, limit, total)
+	}
 
-	return keyAccessServers, nil
+	return &kasregistry.ListKeyAccessServersResponse{
+		KeyAccessServers: keyAccessServers,
+		Pagination: &policy.PageResponse{
+			CurrentOffset: offset,
+			Total:         total,
+			NextOffset:    nextOffset,
+		},
+	}, nil
 }
 
 func (c PolicyDBClient) GetKeyAccessServer(ctx context.Context, id string) (*policy.KeyAccessServer, error) {
@@ -66,14 +91,16 @@ func (c PolicyDBClient) GetKeyAccessServer(ctx context.Context, id string) (*pol
 	return &policy.KeyAccessServer{
 		Id:        kas.ID,
 		Uri:       kas.Uri,
-		Metadata:  metadata,
 		PublicKey: publicKey,
+		Name:      kas.Name.String,
+		Metadata:  metadata,
 	}, nil
 }
 
 func (c PolicyDBClient) CreateKeyAccessServer(ctx context.Context, r *kasregistry.CreateKeyAccessServerRequest) (*policy.KeyAccessServer, error) {
 	uri := r.GetUri()
 	publicKey := r.GetPublicKey()
+	name := strings.ToLower(r.GetName())
 
 	metadataJSON, metadata, err := db.MarshalCreateMetadata(r.GetMetadata())
 	if err != nil {
@@ -88,6 +115,7 @@ func (c PolicyDBClient) CreateKeyAccessServer(ctx context.Context, r *kasregistr
 	createdID, err := c.Queries.CreateKeyAccessServer(ctx, CreateKeyAccessServerParams{
 		Uri:       uri,
 		PublicKey: publicKeyJSON,
+		Name:      pgtypeText(name),
 		Metadata:  metadataJSON,
 	})
 	if err != nil {
@@ -98,6 +126,7 @@ func (c PolicyDBClient) CreateKeyAccessServer(ctx context.Context, r *kasregistr
 		Id:        createdID,
 		Uri:       uri,
 		PublicKey: publicKey,
+		Name:      name,
 		Metadata:  metadata,
 	}, nil
 }
@@ -105,6 +134,7 @@ func (c PolicyDBClient) CreateKeyAccessServer(ctx context.Context, r *kasregistr
 func (c PolicyDBClient) UpdateKeyAccessServer(ctx context.Context, id string, r *kasregistry.UpdateKeyAccessServerRequest) (*policy.KeyAccessServer, error) {
 	uri := r.GetUri()
 	publicKey := r.GetPublicKey()
+	name := strings.ToLower(r.GetName())
 
 	// if extend we need to merge the metadata
 	metadataJSON, metadata, err := db.MarshalUpdateMetadata(r.GetMetadata(), r.GetMetadataUpdateBehavior(), func() (*common.Metadata, error) {
@@ -129,6 +159,7 @@ func (c PolicyDBClient) UpdateKeyAccessServer(ctx context.Context, id string, r 
 	count, err := c.Queries.UpdateKeyAccessServer(ctx, UpdateKeyAccessServerParams{
 		ID:        id,
 		Uri:       pgtypeText(uri),
+		Name:      pgtypeText(name),
 		PublicKey: publicKeyJSON,
 		Metadata:  metadataJSON,
 	})
@@ -142,6 +173,7 @@ func (c PolicyDBClient) UpdateKeyAccessServer(ctx context.Context, id string, r 
 	return &policy.KeyAccessServer{
 		Id:        id,
 		Uri:       uri,
+		Name:      name,
 		PublicKey: publicKey,
 		Metadata:  metadata,
 	}, nil
@@ -162,10 +194,19 @@ func (c PolicyDBClient) DeleteKeyAccessServer(ctx context.Context, id string) (*
 	}, nil
 }
 
-func (c PolicyDBClient) ListKeyAccessServerGrants(ctx context.Context, kasID string, kasURI string) ([]*kasregistry.KeyAccessServerGrants, error) {
+func (c PolicyDBClient) ListKeyAccessServerGrants(ctx context.Context, r *kasregistry.ListKeyAccessServerGrantsRequest) (*kasregistry.ListKeyAccessServerGrantsResponse, error) {
+	limit, offset := c.getRequestedLimitOffset(r.GetPagination())
+	maxLimit := c.listCfg.limitMax
+	if maxLimit > 0 && limit > maxLimit {
+		return nil, db.ErrListLimitTooLarge
+	}
+
 	params := ListKeyAccessServerGrantsParams{
-		KasID:  kasID,
-		KasUri: kasURI,
+		KasID:   r.GetKasId(),
+		KasUri:  r.GetKasUri(),
+		KasName: r.GetKasName(),
+		Offset:  offset,
+		Limit:   limit,
 	}
 	listRows, err := c.Queries.ListKeyAccessServerGrants(ctx, params)
 	if err != nil {
@@ -182,6 +223,7 @@ func (c PolicyDBClient) ListKeyAccessServerGrants(ctx context.Context, kasID str
 			Id:        grant.KasID,
 			Uri:       grant.KasUri,
 			PublicKey: pubKey,
+			Name:      grant.KasName.String,
 		}
 		attrGrants, err := db.GrantedPolicyObjectProtoJSON(grant.AttributesGrants)
 		if err != nil {
@@ -202,6 +244,18 @@ func (c PolicyDBClient) ListKeyAccessServerGrants(ctx context.Context, kasID str
 			NamespaceGrants: namespaceGrants,
 		}
 	}
-
-	return grants, nil
+	var total int32
+	var nextOffset int32
+	if len(listRows) > 0 {
+		total = int32(listRows[0].Total)
+		nextOffset = getNextOffset(offset, limit, total)
+	}
+	return &kasregistry.ListKeyAccessServerGrantsResponse{
+		Grants: grants,
+		Pagination: &policy.PageResponse{
+			CurrentOffset: params.Offset,
+			Total:         total,
+			NextOffset:    nextOffset,
+		},
+	}, nil
 }

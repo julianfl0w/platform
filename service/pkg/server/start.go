@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/opentdf/platform/sdk"
+	"github.com/opentdf/platform/service/internal/auth"
 	"github.com/opentdf/platform/service/internal/config"
 	"github.com/opentdf/platform/service/internal/server"
 	"github.com/opentdf/platform/service/logger"
@@ -88,6 +89,20 @@ func Start(f ...StartOptions) error {
 		}
 	}
 
+	// Set the authz policy
+	if startConfig.authzPolicy != "" {
+		if otdf.AuthN == nil {
+			err := errors.New("authn not enabled")
+			logger.Error("issue setting authz policy", slog.String("error", err.Error()))
+			return fmt.Errorf("issue setting authz policy: %w", err)
+		}
+		err := otdf.AuthN.SetAuthzPolicy(startConfig.authzPolicy)
+		if err != nil {
+			logger.Error("issue setting authz policy", slog.String("error", err.Error()))
+			return fmt.Errorf("issue setting authz policy: %w", err)
+		}
+	}
+
 	// Initialize the service registry
 	logger.Debug("initializing service registry")
 	svcRegistry := serviceregistry.NewServiceRegistry()
@@ -126,9 +141,9 @@ func Start(f ...StartOptions) error {
 	if len(startConfig.extraServices) > 0 {
 		logger.Debug("registering extra services")
 		for _, service := range startConfig.extraServices {
-			err := svcRegistry.RegisterService(service, service.Namespace)
+			err := svcRegistry.RegisterService(service, service.GetNamespace())
 			if err != nil {
-				logger.Error("could not register extra service", slog.String("namespace", service.Namespace), slog.String("error", err.Error()))
+				logger.Error("could not register extra service", slog.String("namespace", service.GetNamespace()), slog.String("error", err.Error()))
 				return fmt.Errorf("could not register extra service: %w", err)
 			}
 		}
@@ -150,13 +165,21 @@ func Start(f ...StartOptions) error {
 	// If client credentials are provided, use them
 	if cfg.SDKConfig.ClientID != "" && cfg.SDKConfig.ClientSecret != "" {
 		sdkOptions = append(sdkOptions, sdk.WithClientCredentials(cfg.SDKConfig.ClientID, cfg.SDKConfig.ClientSecret, nil))
+
+		oidcconfig, err := auth.DiscoverOIDCConfiguration(ctx, cfg.Server.Auth.Issuer, logger)
+		if err != nil {
+			return fmt.Errorf("could not retrieve oidc configuration: %w", err)
+		}
+
+		// provide token endpoint -- sdk cannot discover it since well-known service isnt running yet
+		sdkOptions = append(sdkOptions, sdk.WithTokenEndpoint(oidcconfig.TokenEndpoint))
 	}
 
 	// If the mode is all, use IPC for the SDK client
 	if slices.Contains(cfg.Mode, "all") || slices.Contains(cfg.Mode, "core") {
 		// Use IPC for the SDK client
 		sdkOptions = append(sdkOptions, sdk.WithIPC())
-		sdkOptions = append(sdkOptions, sdk.WithCustomCoreConnection(otdf.GRPCInProcess.Conn()))
+		sdkOptions = append(sdkOptions, sdk.WithCustomCoreConnection(otdf.ConnectRPCInProcess.Conn()))
 
 		client, err = sdk.New("", sdkOptions...)
 		if err != nil {
